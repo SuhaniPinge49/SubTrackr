@@ -145,6 +145,7 @@ export function detectSubscriptions(transactions) {
     const monthly = Math.round(avgAmount);
     const name = sorted[0].name;
     const category = getCategory(name);
+    const confidenceScore = Math.min(99, Math.round((sorted.length / 6) * 100));
 
     subscriptions.push({
       id: `${name}-${monthly}`,
@@ -155,10 +156,10 @@ export function detectSubscriptions(transactions) {
       intervalDays: Math.round(avgInterval),
       lastPayment: sorted[sorted.length - 1].date,
       nextPayment: addDays(sorted[sorted.length - 1].date, Math.round(avgInterval)),
-      confidence: Math.min(99, Math.round((sorted.length / 6) * 100)),
+      confidence: confidenceScore,
       transactionsCount: sorted.length,
       warning: monthly >= 1000,
-      priority: getCancelPriority({ cost: monthly, confidence: sorted.length }),
+      priority: getCancelPriority({ cost: monthly, confidenceScore }),
     });
   });
 
@@ -197,9 +198,9 @@ function addDays(date, days) {
   return next;
 }
 
-function getCancelPriority({ cost, confidence }) {
-  if (cost >= 1000 || confidence <= 45) return "High";
-  if (cost >= 400 || confidence <= 70) return "Medium";
+function getCancelPriority({ cost, confidenceScore }) {
+  if (cost >= 1500 || confidenceScore <= 45) return "High";
+  if (cost >= 500 || confidenceScore <= 70) return "Medium";
   return "Low";
 }
 

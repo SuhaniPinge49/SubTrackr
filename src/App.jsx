@@ -54,6 +54,11 @@ function priorityWeight(priority) {
   return 1;
 }
 
+function isUsersDataTableMissing(error) {
+  const msg = `${error?.message || ""}`.toLowerCase();
+  return msg.includes("could not find the table") && msg.includes("users_data");
+}
+
 export default function App() {
   const [isDark, setIsDark] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -70,7 +75,17 @@ export default function App() {
   const [authError, setAuthError] = useState("");
   const [toast, setToast] = useState("");
   const [uploadedFileName, setUploadedFileName] = useState("");
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isCloudTableReady, setIsCloudTableReady] = useState(true);
   const [form, setForm] = useState({ name: "", email: "", password: "" });
+  const [profile, setProfile] = useState({
+    fullName: "",
+    phone: "",
+    city: "",
+    studentMode: true,
+    monthlyBudget: 2500,
+  });
+  const appBaseUrl = import.meta.env.VITE_APP_URL || window.location.origin;
 
   useEffect(() => {
     let mounted = true;
@@ -89,7 +104,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const url = new URL(window.location.href);
+    const errorCode = url.searchParams.get("error_code");
+    const errorDescription = url.searchParams.get("error_description");
+    if (!errorCode && !errorDescription) return;
+
+    const readable = (errorDescription || "Authentication link is invalid.")
+      .replace(/\+/g, " ")
+      .trim();
+    if (errorCode === "otp_expired") {
+      setAuthError("Confirmation link expired. Please sign in again to receive a fresh link.");
+    } else {
+      setAuthError(readable);
+    }
+
+    url.searchParams.delete("error");
+    url.searchParams.delete("error_code");
+    url.searchParams.delete("error_description");
+    window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+  }, []);
+
+  useEffect(() => {
     if (!currentUser?.id) return;
+    if (!isCloudTableReady) return;
     getLatestUserDataset(currentUser.id)
       .then((latest) => {
         if (!latest?.subscriptions_detected) return;
@@ -97,13 +134,40 @@ export default function App() {
         setCancelled([]);
         setUploadedFileName(latest.uploaded_file_name || "");
       })
-      .catch(() => {
-        // Silent fail to keep UI usable even if table is not yet created.
+      .catch((fetchError) => {
+        if (isUsersDataTableMissing(fetchError)) {
+          setIsCloudTableReady(false);
+          setError("");
+          setToast("Cloud sync unavailable: users_data table not found.");
+          window.setTimeout(() => setToast(""), 3200);
+          return;
+        }
       });
+  }, [currentUser?.id, isCloudTableReady]);
+
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    const raw = localStorage.getItem(`subtrackr_profile_${currentUser.id}`);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      setProfile((prev) => ({
+        ...prev,
+        ...parsed,
+        studentMode:
+          typeof parsed.studentMode === "boolean"
+            ? parsed.studentMode
+            : String(parsed.studentMode).toLowerCase() === "true",
+        monthlyBudget: Number(parsed.monthlyBudget) || prev.monthlyBudget,
+      }));
+    } catch {
+      // Ignore malformed local profile.
+    }
   }, [currentUser?.id]);
 
   useEffect(() => {
     if (!currentUser?.id) return;
+    if (!isCloudTableReady) return;
     const channel = supabase
       .channel(`users-data-${currentUser.id}`)
       .on(
@@ -115,11 +179,18 @@ export default function App() {
           filter: `user_id=eq.${currentUser.id}`,
         },
         async () => {
-          const latest = await getLatestUserDataset(currentUser.id);
-          if (latest?.subscriptions_detected) {
-            setSubscriptions(
-              Array.isArray(latest.subscriptions_detected) ? latest.subscriptions_detected : []
-            );
+          try {
+            const latest = await getLatestUserDataset(currentUser.id);
+            if (latest?.subscriptions_detected) {
+              setSubscriptions(
+                Array.isArray(latest.subscriptions_detected) ? latest.subscriptions_detected : []
+              );
+            }
+          } catch (fetchError) {
+            if (isUsersDataTableMissing(fetchError)) {
+              setIsCloudTableReady(false);
+              setError("");
+            }
           }
         }
       )
@@ -127,7 +198,7 @@ export default function App() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [currentUser?.id]);
+  }, [currentUser?.id, isCloudTableReady]);
 
   const insights = useMemo(
     () => buildInsights(subscriptions.filter((s) => !cancelled.includes(s.id))),
@@ -193,19 +264,37 @@ export default function App() {
       setSubscriptions(subs);
       setCancelled([]);
       setUploadedFileName(file.name);
-      if (currentUser?.id) {
-        await saveUserDataset({
-          userId: currentUser.id,
-          email: currentUser.email || "",
-          uploadedFileName: file.name,
-          totalSubscriptionSpend: subs.reduce((sum, s) => sum + s.cost, 0),
-          subscriptionsDetected: subs,
-          savingsAmount: 0,
-        });
-        setToast("Data saved successfully");
-        window.setTimeout(() => setToast(""), 2500);
+      if (currentUser?.id && isCloudTableReady) {
+        try {
+          await saveUserDataset({
+            userId: currentUser.id,
+            email: currentUser.email || "",
+            uploadedFileName: file.name,
+            totalSubscriptionSpend: subs.reduce((sum, s) => sum + s.cost, 0),
+            subscriptionsDetected: subs,
+            savingsAmount: 0,
+          });
+          setToast("Data saved successfully");
+          window.setTimeout(() => setToast(""), 2500);
+        } catch (saveError) {
+          if (isUsersDataTableMissing(saveError)) {
+            setIsCloudTableReady(false);
+            setError("");
+            setToast("CSV processed. Cloud sync is not configured yet.");
+            window.setTimeout(() => setToast(""), 3000);
+          } else {
+            throw saveError;
+          }
+        }
       }
     } catch (e) {
+      if (isUsersDataTableMissing(e)) {
+        setIsCloudTableReady(false);
+        setError("");
+        setToast("CSV processed. Cloud sync is not configured yet.");
+        window.setTimeout(() => setToast(""), 3000);
+        return;
+      }
       setError(e.message || "Could not process the file.");
     } finally {
       setLoading(false);
@@ -219,7 +308,7 @@ export default function App() {
     setSubscriptions(subs);
     setCancelled([]);
     setUploadedFileName("demo_transactions.json");
-    if (currentUser?.id) {
+    if (currentUser?.id && isCloudTableReady) {
       try {
         await saveUserDataset({
           userId: currentUser.id,
@@ -231,8 +320,15 @@ export default function App() {
         });
         setToast("Data saved successfully");
         window.setTimeout(() => setToast(""), 2500);
-      } catch {
-        setError("Could not save demo data to cloud.");
+      } catch (saveError) {
+        if (isUsersDataTableMissing(saveError)) {
+          setIsCloudTableReady(false);
+          setError("");
+          setToast("Demo loaded. Cloud sync is not configured yet.");
+          window.setTimeout(() => setToast(""), 3000);
+        } else {
+          setError("Could not save demo data to cloud.");
+        }
       }
     }
   }
@@ -248,7 +344,7 @@ export default function App() {
     ? insights.potentialSavings * 12
     : insights.potentialSavings;
   const periodLabel = yearlyProjection ? "/year" : "/month";
-  const studentBudget = 2500;
+  const studentBudget = Number(profile.monthlyBudget) || 2500;
   const overspend = Math.max(0, insights.totalMonthly - studentBudget);
   const yearlySavingFromCancel = cancelled
     .map((id) => subscriptions.find((sub) => sub.id === id)?.cost || 0)
@@ -256,7 +352,7 @@ export default function App() {
   const progressTarget = 5000;
   const savingsProgress = Math.min(100, (yearlySavingFromCancel / progressTarget) * 100);
 
-  function handleAuthSubmit(event) {
+  async function handleAuthSubmit(event) {
     event.preventDefault();
     setAuthError("");
     const email = form.email.trim().toLowerCase();
@@ -273,35 +369,68 @@ export default function App() {
       return;
     }
 
-    (async () => {
-      if (authMode === "signup") {
-        const { error: signUpError } = await supabase.auth.signUp({
-          email,
-          password,
-          options: { data: { full_name: name } },
-        });
-        if (signUpError) {
-          setAuthError(signUpError.message);
-          return;
-        }
-        await sendAuthNotificationEmail(email);
-        setToast("Signup successful. Check your email confirmation.");
-        window.setTimeout(() => setToast(""), 2500);
-        return;
-      }
-
-      const { error: loginError } = await supabase.auth.signInWithPassword({
+    if (authMode === "signup") {
+      const { error: signUpError } = await supabase.auth.signUp({
         email,
         password,
+        options: {
+          data: { full_name: name },
+          emailRedirectTo: `${appBaseUrl}/`,
+        },
       });
-      if (loginError) {
-        setAuthError(loginError.message);
+      if (signUpError) {
+        const msg = (signUpError.message || "").toLowerCase();
+        const isEmailRateLimit =
+          msg.includes("rate limit") ||
+          msg.includes("email rate limit") ||
+          msg.includes("too many requests");
+        if (isEmailRateLimit) {
+          // Graceful fallback: account may already exist; try direct password login.
+          const { error: fallbackLoginError } = await supabase.auth.signInWithPassword({
+            email,
+            password,
+          });
+          if (!fallbackLoginError) {
+            setToast("Login successful");
+            window.setTimeout(() => setToast(""), 2500);
+            return;
+          }
+          setAuthError(
+            "Email sending is temporarily rate-limited. Please wait a few minutes, then try Sign In."
+          );
+          return;
+        }
+        setAuthError(signUpError.message);
         return;
       }
       await sendAuthNotificationEmail(email);
-      setToast("Login successful");
+      setToast("Signup successful. Check your email confirmation.");
       window.setTimeout(() => setToast(""), 2500);
-    })();
+      return;
+    }
+
+    const { error: loginError } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (loginError) {
+      setAuthError(loginError.message);
+      return;
+    }
+    await sendAuthNotificationEmail(email);
+    setToast("Login successful");
+    window.setTimeout(() => setToast(""), 2500);
+  }
+
+  function handleProfileSave() {
+    if (!currentUser?.id) return;
+    localStorage.setItem(`subtrackr_profile_${currentUser.id}`, JSON.stringify(profile));
+    setToast("Profile settings saved");
+    window.setTimeout(() => setToast(""), 2200);
+  }
+
+  function closeProfileModal() {
+    setIsProfileOpen(false);
   }
 
   function logout() {
@@ -493,9 +622,12 @@ export default function App() {
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <span className="hidden rounded-full border border-white/20 bg-white/10 px-3 py-1 text-xs text-slate-200 sm:inline">
+              <button
+                onClick={() => setIsProfileOpen(true)}
+                className="hidden rounded-full border border-white/20 bg-white/10 px-3 py-1 text-xs text-slate-200 transition hover:scale-105 sm:inline"
+              >
                 {currentUser?.user_metadata?.full_name || currentUser?.email}
-              </span>
+              </button>
               <button
                 onClick={() => setIsDark((v) => !v)}
                 className="rounded-full border border-white/20 bg-white/10 p-2 transition hover:scale-105"
@@ -557,7 +689,7 @@ export default function App() {
             )}
           </section>
 
-          {insights.activeCount > 0 && (
+          {Boolean(profile.studentMode) && insights.activeCount > 0 && (
             <section className="mb-6 rounded-2xl border border-amber-400/40 bg-amber-500/10 p-4">
               <div className="flex items-start gap-3">
                 <CircleAlert className="mt-0.5 text-amber-300" size={18} />
@@ -573,6 +705,30 @@ export default function App() {
                   </p>
                 </div>
               </div>
+            </section>
+          )}
+
+          {Boolean(profile.studentMode) && (
+            <section className="mb-6">
+              <Panel title="Student Mode Insights">
+                <div className="space-y-2 text-sm">
+                  <div className="rounded-lg border border-amber-400/30 bg-amber-500/10 p-3">
+                    Detecting overspending:{" "}
+                    <span className="font-semibold">
+                      {overspend > 0 ? `${currency(overspend)}/month above budget` : "On budget"}
+                    </span>
+                  </div>
+                  <div className="rounded-lg border border-sky-400/30 bg-sky-500/10 p-3">
+                    Suggesting cheaper alternatives:{" "}
+                    <span className="font-semibold">
+                      {suggestAlternative(visibleSubscriptions[0]?.name || "subscription")}
+                    </span>
+                  </div>
+                  <div className="rounded-lg border border-emerald-400/30 bg-emerald-500/10 p-3">
+                    Providing clear, actionable alerts for high-cost and hidden subscriptions.
+                  </div>
+                </div>
+              </Panel>
             </section>
           )}
 
@@ -638,7 +794,9 @@ export default function App() {
               <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 p-4">
                 <p className="text-sm text-emerald-200">
                   You saved {currency(yearlySavingFromCancel)} this year{" "}
-                  <span className="inline-block animate-pulse">🎉</span>
+                  {yearlySavingFromCancel > 0 ? (
+                    <span className="inline-block animate-pulse">🎉</span>
+                  ) : null}
                 </p>
                 <div className="mt-3 h-3 overflow-hidden rounded-full bg-slate-700">
                   <div
@@ -887,6 +1045,84 @@ export default function App() {
           )}
         </div>
       </div>
+      {isProfileOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="glass w-full max-w-3xl rounded-2xl p-5">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-xl font-bold">Profile Settings</h2>
+              <button
+                onClick={closeProfileModal}
+                className="rounded-lg border border-white/20 px-3 py-1 text-xs hover:bg-white/10"
+              >
+                Close
+              </button>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="text-xs text-slate-300">
+                Full Name
+                <input
+                  className="mt-1 w-full rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm outline-none"
+                  value={profile.fullName}
+                  onChange={(e) => setProfile((p) => ({ ...p, fullName: e.target.value }))}
+                  placeholder="Enter your full name"
+                />
+              </label>
+              <label className="text-xs text-slate-300">
+                Phone
+                <input
+                  className="mt-1 w-full rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm outline-none"
+                  value={profile.phone}
+                  onChange={(e) => setProfile((p) => ({ ...p, phone: e.target.value }))}
+                  placeholder="10-digit mobile"
+                />
+              </label>
+              <label className="text-xs text-slate-300">
+                City
+                <input
+                  className="mt-1 w-full rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm outline-none"
+                  value={profile.city}
+                  onChange={(e) => setProfile((p) => ({ ...p, city: e.target.value }))}
+                  placeholder="Your city"
+                />
+              </label>
+              {Boolean(profile.studentMode) && (
+                <label className="text-xs text-slate-300">
+                  Student Monthly Budget (INR)
+                  <input
+                    type="number"
+                    min="0"
+                    className="mt-1 w-full rounded-lg border border-white/20 bg-white/10 px-3 py-2 text-sm outline-none"
+                    value={profile.monthlyBudget}
+                    onChange={(e) =>
+                      setProfile((p) => ({ ...p, monthlyBudget: Number(e.target.value) || 0 }))
+                    }
+                  />
+                </label>
+              )}
+            </div>
+            <div className="mt-3 flex items-center justify-between rounded-lg border border-white/10 bg-white/5 px-3 py-2">
+              <span className="text-sm text-slate-200">Student Mode</span>
+              <button
+                onClick={() => setProfile((p) => ({ ...p, studentMode: !p.studentMode }))}
+                className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                  profile.studentMode ? "bg-emerald-500 text-black" : "bg-slate-700 text-slate-200"
+                }`}
+              >
+                {profile.studentMode ? "ON" : "OFF"}
+              </button>
+            </div>
+            <button
+              onClick={() => {
+                handleProfileSave();
+                closeProfileModal();
+              }}
+              className="mt-3 rounded-lg bg-violet-500 px-4 py-2 text-xs font-semibold transition hover:scale-105"
+            >
+              Save Profile
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
